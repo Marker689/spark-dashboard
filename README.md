@@ -370,7 +370,11 @@ show), and the KV-cache figure is its `kv_cache_usage_ratio` — the tokens a li
 stream holds over that stream's context window. That gauge therefore stays small
 while requests are short and reads 0 when no stream is live (the engine reports
 0 there, not an absent series); it is a stream's cache occupancy, not the
-device's KV-pool utilization. With `--api-key` set, the open health route answers
+device's KV-pool utilization. With a multi-stream launch (`--parallel N`) the
+engine fits and shares the context window between the streams while the gauge
+divides a stream's tokens by the whole window, so a stream filled to its own
+limit reads about 1/N of it — 25% at `--parallel 4` — and the reading can never
+pass that share. With `--api-key` set, the open health route answers
 only the status, so the dashboard falls back to diffing the scrape's counters
 for the live rate.
 
