@@ -83,6 +83,19 @@ pub struct TensorfoldAdapter {
     /// rather than as the tile's "not yet". Monotonic: the families do not come
     /// and go for one engine.
     prefix_cache_seen: AtomicBool,
+    /// The engine's own live rates from its last `/health` answer: the tokens
+    /// it decoded and prefilled in its last 2 s window, divided by 2 — the
+    /// same figure its terminal line and its `--dashboard` page show. `/health`
+    /// is open even when an API key gates the rest, but such a launch answers
+    /// only `{"status":"ok"}`, so the rates are `None` there and the scrape
+    /// counters are diffed instead.
+    live_rates: Mutex<Option<LiveRates>>,
+    /// Running means of the engine-reported generation and prefill rates, for
+    /// the `avg_*` fields beside them. Only polls that saw throughput count, so
+    /// the average holds steady while the engine idles — the rule
+    /// `CounterRate` follows for the counter-diffed fallback.
+    decode_rate_mean: Mutex<RateMean>,
+    prefill_rate_mean: Mutex<RateMean>,
 }
 
 impl TensorfoldAdapter {
@@ -104,6 +117,9 @@ impl TensorfoldAdapter {
             )),
             metrics_unauthorized: AtomicBool::new(false),
             prefix_cache_seen: AtomicBool::new(false),
+            live_rates: Mutex::default(),
+            decode_rate_mean: Mutex::default(),
+            prefill_rate_mean: Mutex::default(),
         }
     }
 
@@ -157,6 +173,55 @@ fn has_prompt_cache_families(parsed: &ParsedMetrics) -> bool {
     ]
     .iter()
     .any(|name| parsed.counters.contains_key(*name))
+}
+
+/// The engine's live decode and prefill rates, from the `live` block of its
+/// `/health` answer.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct LiveRates {
+    decode_tps: Option<f64>,
+    prefill_tps: Option<f64>,
+}
+
+/// The `live` block of a `/health` body: the tokens the engine decoded and
+/// prefilled in its last 2 s window, divided by 2. `None` when the answer does
+/// not carry such a block — a key-gated launch answers only `{"status":"ok"}`.
+fn health_live_rates(body: &str) -> Option<LiveRates> {
+    let answer = serde_json::from_str::<Value>(body).ok()?;
+    let live = answer.get("live")?;
+    let rate = |key: &str| live.get(key).and_then(Value::as_f64);
+    let rates = LiveRates {
+        decode_tps: rate("decode_tokens_per_second"),
+        prefill_tps: rate("prefill_tokens_per_second"),
+    };
+    (rates.decode_tps.is_some() || rates.prefill_tps.is_some()).then_some(rates)
+}
+
+/// The running average of rates the engine itself reported. Only polls that
+/// saw throughput are counted, so the average holds steady across the idle
+/// polls a live engine spends between requests.
+#[derive(Debug, Default)]
+struct RateMean {
+    /// `(sum of the rates, how many)`.
+    accum: (f64, u64),
+}
+
+impl RateMean {
+    /// Feed one poll's engine-reported rate; returns the running average, or
+    /// `None` before any poll has seen throughput.
+    fn observe(&mut self, rate: Option<f64>) -> Option<f64> {
+        if let Some(rate) = rate {
+            if rate > 0.0 {
+                self.accum.0 += rate;
+                self.accum.1 += 1;
+            }
+        }
+        (self.accum.1 > 0).then(|| self.accum.0 / self.accum.1 as f64)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// The `(accepted, drafted)` MTP counters as read, with the vLLM-named mirrors
@@ -245,6 +310,11 @@ impl EngineAdapter for TensorfoldAdapter {
     /// there). A loading engine says `warming: true`; 2xx without it is
     /// running; a non-2xx is an error naming the status — and a failure to
     /// reach the server is an error too, never "metrics off".
+    ///
+    /// The same answer carries the engine's own live decode and prefill rates;
+    /// they are stored here for the next `get_metrics` (the poll probes health
+    /// first), or cleared when this answer has no `live` block so the scrape
+    /// counters are diffed instead of keeping a stale rate.
     async fn health_check(&self) -> EngineStatus {
         let response = match self.http.get(HEALTH_PATH).send().await {
             Ok(response) => response,
@@ -252,6 +322,7 @@ impl EngineAdapter for TensorfoldAdapter {
         };
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        *self.live_rates.lock().await = health_live_rates(&body);
         health_status(status, &body)
     }
 
@@ -304,6 +375,8 @@ impl EngineAdapter for TensorfoldAdapter {
         if warmup_out.just_transitioned {
             self.gen_rate.lock().await.reset();
             self.prompt_rate.lock().await.reset();
+            self.decode_rate_mean.lock().await.reset();
+            self.prefill_rate_mean.lock().await.reset();
             *self.prev_spec_decode.lock().await = None;
             tracing::info!(
                 endpoint = %self.http.endpoint(),
@@ -317,10 +390,28 @@ impl EngineAdapter for TensorfoldAdapter {
         let current_gen = counter("tensorfold_generation_tokens_total");
         let current_prompt = counter("tensorfold_prompt_tokens_total");
         let now = Instant::now();
-        let (tokens_per_sec, avg_tokens_per_sec) =
-            self.gen_rate.lock().await.observe(current_gen, now);
+        // Live throughput: the engine's own windowed rate from `/health` when
+        // its answer carried one. Its scrape counters only move when a request
+        // finishes, so diffing them — the fallback for a key-gated launch,
+        // whose open health route answers just the status — reads zero while
+        // requests are still decoding and bursts by a whole request's tokens
+        // when one completes.
+        let live_rates = *self.live_rates.lock().await;
+        let (tokens_per_sec, avg_tokens_per_sec) = match live_rates.and_then(|l| l.decode_tps) {
+            Some(rate) => (
+                Some(rate),
+                self.decode_rate_mean.lock().await.observe(Some(rate)),
+            ),
+            None => self.gen_rate.lock().await.observe(current_gen, now),
+        };
         let (prompt_tokens_per_sec, avg_prompt_tokens_per_sec) =
-            self.prompt_rate.lock().await.observe(current_prompt, now);
+            match live_rates.and_then(|l| l.prefill_tps) {
+                Some(rate) => (
+                    Some(rate),
+                    self.prefill_rate_mean.lock().await.observe(Some(rate)),
+                ),
+                None => self.prompt_rate.lock().await.observe(current_prompt, now),
+            };
 
         // Live (windowed) acceptance rate from per-poll deltas of the MTP
         // counters. The snapshot is discarded whenever a counter is absent —
@@ -1155,6 +1246,120 @@ tensorfold:prefix_cache_queries_total 100
         assert!(third.ttft_ms.is_some_and(|ms| ms > 0.0));
     }
 
+    /// The live throughput is the engine's own windowed rate from `/health` —
+    /// not a diff of the scrape counters, which only move when a request
+    /// finishes and read zero while requests are still decoding.
+    #[tokio::test]
+    async fn live_throughput_is_the_engines_own_windowed_rate() {
+        use super::super::test_server::TestServer;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        let health_polls = Arc::new(AtomicU64::new(0));
+        let served_health = health_polls.clone();
+        let metric_polls = Arc::new(AtomicU64::new(0));
+        let served_metrics = metric_polls.clone();
+        let server = TestServer::start(move |r| match r.path.as_str() {
+            "/health" => {
+                let n = served_health.fetch_add(1, Ordering::SeqCst);
+                let decode = 60.0 + 10.0 * n as f64;
+                (
+                    200,
+                    format!(
+                        r#"{{"status":"ok","model":"m","warming":false,"live":{{"connections":0,"waiting":0,"decode_tokens_per_second":{decode},"prefill_tokens_per_second":0.0}}}}"#
+                    ),
+                )
+            }
+            "/v1/metrics" => {
+                let n = served_metrics.fetch_add(1, Ordering::SeqCst);
+                (200, growing_scrape(5 + n, 1000 + 100 * n))
+            }
+            _ => (404, String::new()),
+        })
+        .await;
+        let adapter =
+            TensorfoldAdapter::new(reqwest::Client::new(), server.url.clone(), None, None);
+
+        // Warmup: the first scrape attaches the baseline, and the rates blank.
+        assert_eq!(adapter.health_check().await, EngineStatus::Running);
+        let first = adapter.get_metrics().await.expect("metrics");
+        assert!(first.warming_up);
+        assert_eq!(first.tokens_per_sec, None);
+
+        // One request later the baseline is captured; the live rate is the
+        // `/health` window (70 tok/s at this poll), not a counter diff.
+        assert_eq!(adapter.health_check().await, EngineStatus::Running);
+        let second = adapter.get_metrics().await.expect("metrics");
+        assert!(!second.warming_up);
+        assert_eq!(second.tokens_per_sec, Some(70.0));
+        assert_eq!(second.avg_tokens_per_sec, Some(70.0));
+        assert_eq!(second.prompt_tokens_per_sec, Some(0.0));
+        assert_eq!(second.avg_prompt_tokens_per_sec, None);
+
+        // The running average follows the engine-reported rates.
+        assert_eq!(adapter.health_check().await, EngineStatus::Running);
+        let third = adapter.get_metrics().await.expect("metrics");
+        assert_eq!(third.tokens_per_sec, Some(80.0));
+        assert_eq!(third.avg_tokens_per_sec, Some(75.0));
+    }
+
+    /// A key-gated launch answers only the status on the open health route, so
+    /// the adapter clears any stored live rate and diffs the scrape counters
+    /// instead of keeping a stale one.
+    #[tokio::test]
+    async fn a_key_gated_health_falls_back_to_diffing_the_scrape_counters() {
+        use super::super::test_server::TestServer;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        let health_polls = Arc::new(AtomicU64::new(0));
+        let served_health = health_polls.clone();
+        let metric_polls = Arc::new(AtomicU64::new(0));
+        let served_metrics = metric_polls.clone();
+        let server = TestServer::start(move |r| match r.path.as_str() {
+            "/health" => {
+                let n = served_health.fetch_add(1, Ordering::SeqCst);
+                let body = if n == 0 {
+                    // An engine that publishes its rates.
+                    r#"{"status":"ok","live":{"decode_tokens_per_second":999.0,"prefill_tokens_per_second":0.0}}"#
+                        .to_string()
+                } else {
+                    // The same engine behind a key: only the status is open.
+                    r#"{"status":"ok"}"#.to_string()
+                };
+                (200, body)
+            }
+            "/v1/metrics" => {
+                let n = served_metrics.fetch_add(1, Ordering::SeqCst);
+                (200, growing_scrape(5 + n, 1000 + 100 * n))
+            }
+            _ => (404, String::new()),
+        })
+        .await;
+        let adapter =
+            TensorfoldAdapter::new(reqwest::Client::new(), server.url.clone(), None, None);
+
+        assert_eq!(adapter.health_check().await, EngineStatus::Running);
+        let first = adapter.get_metrics().await.expect("metrics");
+        assert!(first.warming_up);
+
+        // The status-only answer clears the 999 tok/s rate: the fallback's
+        // first counter diff has no previous reading yet.
+        assert_eq!(adapter.health_check().await, EngineStatus::Running);
+        let second = adapter.get_metrics().await.expect("metrics");
+        assert!(!second.warming_up);
+        assert_eq!(
+            second.tokens_per_sec, None,
+            "the stale live rate must not survive a status-only health answer"
+        );
+
+        // Steady state: the counter delta fills the rate in.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(adapter.health_check().await, EngineStatus::Running);
+        let third = adapter.get_metrics().await.expect("metrics");
+        assert!(third.tokens_per_sec.is_some_and(|tps| tps > 0.0));
+    }
+
     /// A metrics 401 latches `AuthRequired` — the state that says the dashboard
     /// lacks the key, not that metrics are off — and a successful answer clears
     /// it, as a fixed provider API key would.
@@ -1305,6 +1510,45 @@ tensorfold:prefix_cache_queries_total 100
         assert!(!third.warming_up);
         assert_close(third.spec_decode_acceptance_rate_live, 50.0);
         assert_close(third.spec_decode_acceptance_rate, 150.0 / 300.0 * 100.0);
+    }
+
+    /// The captured health answer carries the engine's own live rates; a
+    /// key-gated answer (status only) or one without the `live` block does not.
+    #[test]
+    fn the_health_live_block_carries_the_engines_own_rates() {
+        let captured = health_live_rates(include_str!("fixtures/tensorfold_health.json"))
+            .expect("the captured answer carries the live block");
+        assert_eq!(captured.decode_tps, Some(126.5));
+        assert_eq!(captured.prefill_tps, Some(0.0));
+        assert_eq!(
+            health_live_rates(r#"{"status":"ok"}"#),
+            None,
+            "the key-gated answer has no live block"
+        );
+        assert_eq!(health_live_rates("not json"), None);
+        assert_eq!(
+            health_live_rates(r#"{"status":"ok","live":{"connections":0}}"#),
+            None,
+            "a live block without a rate is no rate"
+        );
+    }
+
+    /// The engine-reported rate average skips idle polls and holds while the
+    /// engine idles, the same rule the counter-diffed rates follow.
+    #[test]
+    fn the_rate_average_skips_idle_polls_and_holds_while_idle() {
+        let mut mean = RateMean::default();
+        assert_eq!(mean.observe(None), None);
+        assert_eq!(mean.observe(Some(0.0)), None);
+        assert_eq!(mean.observe(Some(80.0)), Some(80.0));
+        assert_eq!(
+            mean.observe(Some(0.0)),
+            Some(80.0),
+            "an idle poll holds the average"
+        );
+        assert_eq!(mean.observe(Some(120.0)), Some(100.0));
+        mean.reset();
+        assert_eq!(mean.observe(Some(50.0)), Some(50.0));
     }
 
     /// Health: a warming engine is loading; a key-gated launch's `{"status":"ok"}`

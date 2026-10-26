@@ -363,6 +363,17 @@ not using speculative decoding; when it does, the counters and rates show, and
 the mean acceptance length stays empty ("--") because TensorFold counts drafted
 and accepted tokens, not draft attempts.
 
+Two readings are the engine's own rather than the dashboard's arithmetic: the
+live decode and prefill throughput come from its `/health` `live` block (tokens
+in the last 2 s over 2, the same number its terminal and `--dashboard` page
+show), and the KV-cache figure is its `kv_cache_usage_ratio` — the tokens a live
+stream holds over that stream's context window. That gauge therefore stays small
+while requests are short and reads 0 when no stream is live (the engine reports
+0 there, not an absent series); it is a stream's cache occupancy, not the
+device's KV-pool utilization. With `--api-key` set, the open health route answers
+only the status, so the dashboard falls back to diffing the scrape's counters
+for the live rate.
+
 Its metrics are served at `/metrics` and `/v1/metrics`. Started with
 `--api-key`, every route except `/`, `/health` and its `/slide` assets needs
 that key, and `/health` answers only `{"status":"ok"}`; pass the key with
